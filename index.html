@@ -407,6 +407,7 @@
         let myChart = null;
         let globalRecords = [];
         let selectedQuality = "Loại 1";
+        let currentChartFilter = "week";
         
         // ĐƯỜNG LINK RENDER
         const BACKEND_URL = "https://dm4-farm-backend.onrender.com";
@@ -487,14 +488,18 @@
         }
 
         function loadHistory() {
-            fetch(`${BACKEND_URL}/api/history?farmer=${loggedInUser}`).then(res => res.json()).then(data => {
+            fetch(`${BACKEND_URL}/api/history?farmer=${loggedInUser}`)
+            .then(res => res.json())
+            .then(data => {
                 if(data.status === "success") {
-                    globalRecords = data.records;
+                    globalRecords = data.records || [];
                     renderHistoryTable(globalRecords);
-                    
-                    // Tự động kích hoạt vẽ biểu đồ Tuần
-                    const defaultBtn = document.getElementById('defaultFilterBtn');
-                    if(defaultBtn) updateChart('week', defaultBtn);
+
+                    // Giữ đúng bộ lọc người dùng đang chọn, không ép về 7 ngày sau mỗi lần reload
+                    const activeBtn = Array.from(document.querySelectorAll('.filter-btn'))
+                        .find(b => (b.getAttribute('onclick') || '').includes(`'${currentChartFilter}'`));
+
+                    updateChart(currentChartFilter || 'week', activeBtn || document.getElementById('defaultFilterBtn'));
                 }
             });
         }
@@ -702,59 +707,132 @@
             });
         }
 
-        // FIX LỖI: DỰA VÀO NGÀY THU HOẠCH GỐC CHỨ KHÔNG DỰA VÀO NGÀY TẠO PHIẾU
+        // FIX LỖI: Biểu đồ "Lưu lượng ghi sổ Blockchain Real-time" phải ưu tiên thời gian ghi sổ thật (r.date),
+        // không dùng ngày thu hoạch (r.ngay_thu) làm thời gian chính.
         function updateChart(timeframe, btn) {
-            if(btn) { document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
+            currentChartFilter = timeframe;
+
+            if(btn) {
+                document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+            }
+
             if(!myChart) return;
-            const now = new Date(); let labels = [], dataPoints = [], agg = {}; 
-            
+
+            const now = new Date();
+            let labels = [];
+            let dataPoints = [];
+            let agg = {};
+
             function parseChartDate(r) {
-                let hDate = r.ngay_thu || r.date; 
-                if(!hDate || hDate.includes('cũ')) return new Date(0);
-                // Nếu YYYY-MM-DD
-                if(hDate.includes('-')) {
-                    let p = hDate.split('-'); return new Date(p[0], p[1]-1, p[2], 0, 0);
+                // Ưu tiên thời gian ghi sổ Blockchain/MongoDB.
+                // Nếu backend dùng field khác thì vẫn bắt được một số tên phổ biến.
+                let rawDate = r.date || r.created_at || r.createdAt || r.ngay_thu;
+
+                if(!rawDate || String(rawDate).includes('cũ')) return new Date(0);
+                rawDate = String(rawDate).trim();
+
+                // ISO: 2026-05-20T12:21:00.000Z
+                if(rawDate.includes('T')) {
+                    const isoDate = new Date(rawDate);
+                    if(!isNaN(isoDate.getTime())) return isoDate;
                 }
-                // Nếu DD/MM/YYYY
-                let parts = hDate.split(' ');
-                let d = parts[0].split('/');
-                let t = [0, 0];
-                // Lấy giờ từ transaction date để biểu đồ Hôm nay hiện đúng
-                if(parts[1]) {
-                    t = parts[1].split(':');
-                } else if (r.date && hDate === r.date.split(' ')[0]) {
-                    let dParts = r.date.split(' ');
-                    if(dParts[1]) t = dParts[1].split(':');
+
+                // YYYY-MM-DD hoặc YYYY-MM-DD HH:mm
+                if(rawDate.includes('-')) {
+                    const parts = rawDate.split(' ');
+                    const d = parts[0].split('-');
+                    const t = parts[1] ? parts[1].split(':') : [0, 0];
+
+                    if(d.length === 3) {
+                        return new Date(
+                            Number(d[0]),
+                            Number(d[1]) - 1,
+                            Number(d[2]),
+                            Number(t[0]) || 0,
+                            Number(t[1]) || 0
+                        );
+                    }
                 }
-                if(d.length === 3) return new Date(d[2], d[1]-1, d[0], t[0], t[1]);
+
+                // DD/MM/YYYY hoặc DD/MM/YYYY HH:mm
+                if(rawDate.includes('/')) {
+                    const parts = rawDate.split(' ');
+                    const d = parts[0].split('/');
+                    const t = parts[1] ? parts[1].split(':') : [0, 0];
+
+                    if(d.length === 3) {
+                        return new Date(
+                            Number(d[2]),
+                            Number(d[1]) - 1,
+                            Number(d[0]),
+                            Number(t[0]) || 0,
+                            Number(t[1]) || 0
+                        );
+                    }
+                }
+
                 return new Date(0);
             }
 
             if(timeframe === 'day') {
-                for(let i=0; i<=now.getHours(); i++) { let h = i.toString().padStart(2, '0') + ":00"; labels.push(h); agg[h] = 0; }
+                for(let i = 0; i <= now.getHours(); i++) {
+                    const h = i.toString().padStart(2, '0') + ":00";
+                    labels.push(h);
+                    agg[h] = 0;
+                }
+
                 globalRecords.forEach(r => {
-                    let d = parseChartDate(r);
-                    if(d.getDate() === now.getDate() && d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear()) {
-                        let h = d.getHours().toString().padStart(2, '0') + ":00";
-                        if(agg[h] !== undefined) agg[h] += r.weight;
+                    const d = parseChartDate(r);
+
+                    if(
+                        d.getDate() === now.getDate() &&
+                        d.getMonth() === now.getMonth() &&
+                        d.getFullYear() === now.getFullYear()
+                    ) {
+                        const h = d.getHours().toString().padStart(2, '0') + ":00";
+                        if(agg[h] !== undefined) {
+                            agg[h] += Number(r.weight) || 0;
+                        }
                     }
                 });
+
                 dataPoints = labels.map(l => agg[l]);
             } else {
-                let daysCount = (timeframe === 'week') ? 6 : 29;
+                const daysCount = timeframe === 'week' ? 6 : 29;
+
                 for(let i = daysCount; i >= 0; i--) {
-                    let d = new Date(now); d.setDate(d.getDate() - i);
-                    let dateStr = d.getDate().toString().padStart(2,'0') + '/' + (d.getMonth()+1).toString().padStart(2,'0');
-                    labels.push(dateStr); agg[dateStr] = 0;
+                    const d = new Date(now);
+                    d.setDate(d.getDate() - i);
+
+                    const dateStr =
+                        d.getDate().toString().padStart(2, '0') +
+                        '/' +
+                        (d.getMonth() + 1).toString().padStart(2, '0');
+
+                    labels.push(dateStr);
+                    agg[dateStr] = 0;
                 }
+
                 globalRecords.forEach(r => {
-                    let d = parseChartDate(r);
-                    let dateStr = d.getDate().toString().padStart(2,'0') + '/' + (d.getMonth()+1).toString().padStart(2,'0');
-                    if(agg[dateStr] !== undefined) agg[dateStr] += r.weight;
+                    const d = parseChartDate(r);
+
+                    const dateStr =
+                        d.getDate().toString().padStart(2, '0') +
+                        '/' +
+                        (d.getMonth() + 1).toString().padStart(2, '0');
+
+                    if(agg[dateStr] !== undefined) {
+                        agg[dateStr] += Number(r.weight) || 0;
+                    }
                 });
+
                 dataPoints = labels.map(l => agg[l]);
             }
-            myChart.data.labels = labels; myChart.data.datasets[0].data = dataPoints; myChart.update();
+
+            myChart.data.labels = labels;
+            myChart.data.datasets[0].data = dataPoints;
+            myChart.update();
         }
     </script>
 </body>
